@@ -1,14 +1,18 @@
 # Generic Unityped Virtual Machine
 
-The generic unityped virtual machine (guvm) is a simple virtual machine for unityped (i.e. dynamically typed) programming languages whose definition is generic over the exact type of values. The language might support integers, arrays, whatevers, the guvm doesn't care. What it does provide are first-class function values (lexically scoped closures).
+The generic unityped virtual machine (guvm) is a simple virtual machine for unityped (i.e. dynamically typed) programming languages. The virtual machine is generic over the type of values, a concrete vm is obtained by specifying the set of values, and some opaque functions that can be used to manipulate them. The instruction set provides everything else that is necessary: control flow, moving values in memory, and the ability to define and call functions.
 
-Functions work by executing instructions such as loading/storing values from/to memory, (conditionally) jumping to other instructions, or calling further functions. The semantics are kept fairly simple, there is no exception handling and every functions has a fixed arity.
+The primary intent is not to provide an efficient implementation, but to offer precise, simple semantics, so that a programming language can be defined by specifying its value set and a translation of language constructs into guvm instructions.
 
-This whole specification is generic over `V`, the type of language-specific non-function values, `B`, the type of built-in functions (see below), and `S`, the type of built-in function states (a rather technical necessity for giving the semantics of stateful built-in functions).
+The virtual machine does not attempt to be a compilation target for any currently popular languages, in fact it eschews some rather standard features in favor of simplicity: there is no exception handling, so invalid actions such as trying to invoke a non-function value immediately terminate program execution, and all functions have a fixed arity between zero and fifteen, invoking a function with the wrong number of arguments also terminates execution.
+
+What the machine does provide are instructions for loading/storing values from/to memory, (conditionally) jumping to other instructions, defining functions (lexically scoped closures to be precise), calling closures and built-in functions, defining asynchronous closures, and concurrently calling asynchronous closures and asynchronous build-in functions. Concurrent calls use corporative, eventloop based scheduling, the execution model is single-threaded and fully deterministic.
 
 ## Preliminary Definitions
 
-All definitions in the specification are given in a [rust](https://www.rust-lang.org/)y, typed pseudocode. In this pseudocode, `Bool` denotes the type of truth values (`true` and `false`), `Nat` the type of natural numbers, `U64` the natural numbers representable with 64 bits.
+All definitions in the specification are given in a [rust](https://www.rust-lang.org/)y, typed pseudocode. The main difference to rust is that everything is moved around by value (as if every time implemented `Copy`). This is effectively regular mathematical notation, but using plaintext and with a well defined way of specifying algebraic datatypes. In this pseudocode, `Bool` denotes the type of truth values (`true` and `false`), `Nat` the type of natural numbers, `U64` the natural numbers representable with 64 bits, `U4` the natural numbers representable with four bits.
+
+The expression `undefined!()` means that something must never occur: the semantics of the virtual machine only well defined on initial states for which no such expression is reachable. A state is also invalid if it contains different functions with the same ordinal (ignore this sentence on your first read-through).
 
 Optional values are represented by the following type:
 
@@ -17,11 +21,20 @@ enum Option<A> {
   Some(A),
   None,
 }
+
+impl<A> Option<A> {
+    fn unwrap(self) -> A {
+        match self {
+            Some(a) => a,
+            None => undefined!(),
+        }
+    }
+}
 ```
 
-`Map<A, B>` is the type of partial mappings from instances of type `A` to instances of type `B`. Let `m: Map<A, B>`, `a: A`, `b: B`. Then `m.get(a): B` denotes the value to which `m` maps `a` (and is undefined if `m` does not map `a`). `m.insert(a, b): Map<A, B>` denotes an updated mapping that works just like `m` except that it maps `a` to `b`. If `m: Map<Nat, B>`, then `m.fresh_key(): Nat` denotes the least natural number that is not mapped by `m`.
+`Map<A, B>` is the type of partial mappings from instances of type `A` to instances of type `B`. Let `m: Map<A, B>`, `a: A`, `b: B`. Then `m.get(a): Option<B>` denotes `Some(v)`, where `v` is the value to which `m` maps `a`, or `None` if no such value exists. `m.insert(a, b): Map<A, B>` denotes an updated mapping that works just like `m` except that it maps `a` to `b`. If `m: Map<Nat, B>`, then `m.fresh_key(): Nat` denotes the least natural number that is not mapped by `m`.
 
-`[A]` this is the type of finite sequences containing `A`s. Let `s: [A]`, `a: A`, `i: Nat`. Then `s.count(): Nat` denotes the number of elements in `s`, `s.push(a): [A]` denotes the sequence obtained by adding `a` as the new last element of `s`, `s.pop(): [A]` denotes the sequence obtained by removing the last element of `s` (undefined if `s` is the empty sequence) `s[i]` denotes the i-th element within `s` (0-based indexing, undefined if the sequence is too short), `s.last(): [A]` denotes `s[s.count() - 1]`, `[]` denotes the empty sequence.
+`[A]` this is the type of finite sequences containing `A`s. Let `s: [A]`, `a: A`, `i: Nat`. Then `s.count(): Nat` denotes the number of elements in `s`. `s.push(a): [A]` denotes the sequence obtained by adding `a` as the new last element of `s`. `s.pop(): [A]` denotes the sequence obtained by removing the last element of `s` (undefined if `s` is the empty sequence). `s[i]: A` denotes the i-th element within `s` (0-based indexing, undefined if the sequence is too short). `s.last(): A` denotes `s[s.count() - 1]`, `[]` denotes the empty sequence. `s.replace(i, a): [A]` denotes the sequence obtained from `s` by replacing the i-th element with `a`, and is undefined if the sequence did not contain an i-th element.
 
 We finally define some type synonyms that will help clarifying what certain index values are intended to be used for:
 
@@ -32,16 +45,251 @@ type GlobalIndex = Nat;
 type LocalIndex = Nat;
 type ScopeIndex = Nat;
 type AncestorDistance = Nat;
-type Arity = Nat;
+type AsyncId = Nat;
+type Arity = U4;
 ```
 
-Whenever the definition of the virtual machine involves natural numbers, an implementation may substitute a finite subset of the natural numbers.
-
-The specification of the language semantics involves expressions that may be undefined, e.g. `m.get(a)` for a mapping `m` that does not map `a`. The specification assumes that prior to running the virtual machine, a conservative check has been performed that makes sure that undefined cases never arise. Since the virtual machine is fairly static (no arbitrarily-computed jumps, fixed numbers of arguments, stack space and heap space for functions), such a check can be performed in linear time. Alternatively, an implementation can forgo such checks, instead exhibiting undefined behavior in any such case. This is not recommended when running untrusted code, but it makes sense when the code is known to be produced from a trusted source, e.g. a compiler that only emits a valid code.
-
-Another precondition for the semantics to make sense is that the ordinals of all functions in a given `State` are distinct.
+Whenever the definition of the virtual machine involves natural numbers, an implementation may substitute fixed with integers instead.
 
 ## Semantics
+
+```rust
+// The state of the virtual machine at a single point in time.
+// This is generic over the type of values that the machine handles: it moves
+// them around, computes intermediate ones, and ultimately either produces a
+// single such value as the result of a computation, terminates erroneously, or
+// runs without ever terminating.
+pub struct VirtualMachine<V: Value> {
+    // The instructions constitute the program that is being executed by the
+    // vm. They never change during a run of the machine.
+    instructions: [Instruction],
+
+    // An index into the `instructions`, indicating which one to execute next.
+    // Most instructions incremented this by one, thus sequentially going
+    // through them. There are however some dedicated instructions for setting
+    // the instruction counter to arbitrary values. Those values are however
+    // always statically determined, there are no dynamically computed jumps.
+    instruction_counter: InstructionIndex,
+
+    // Locations containing values that are available for being accessed and
+    // updated from any point in the program.
+    globals: [V],
+
+    // Locations containing values that are in principle available for being
+    // accessed and updated from any point in the program, but only if the
+    // correct `ScopeId` is available. This somewhat correspondends to
+    // heap-allocated memory and is used for implementing lexically scoped
+    // closures. A real implementation would perform garbage collection,
+    // removing scopes whose id has become unreachable from the current state.
+    scopes: Map<ScopeId, Scope>,
+
+    // A stack that manages all the state for performing synchronous closure
+    // calls. Calling a closure appends a StackFrame, returning from a closure
+    // call pops the last StackFrame.
+    //
+    // Each frame stores some of bookkeeping information for knowing how to
+    // continue when the call returns, provides some value locations that are
+    // available only from within that call, and introduces a new Scope which
+    // can be accessed from the call and from all invocations of closures that
+    // are created from within the call.
+    stack: [StackFrame<V>],
+
+    // The asynchronous counterpart to the stack. Calling an asynchronous
+    // closure creates an AsyncFrame and adds it to the map with a fresh id.
+    // Just like StackFrames, AsyncFrames store (slightly different)
+    // bookkeeping information, provide value locations local to the call, and
+    // a new scope shared between the call and all closures created from within.
+    //
+    // When calling an asynchronous function, the current call continues
+    // immediately without access to the result. A different part of the
+    // closure's instructions, one that has access to the result, is scheduled
+    // for being executed once the invoked asynchronous function has returned.
+    // Conceptually, these two independent strands execute concurrently.
+    // Importantly, both strands share the same AsyncFrame, so they have access
+    // to the same values.
+    //
+    // The first strand belonging to a certain AsyncFrame to return a value
+    // concludes that call. A strand can also *yield*, i.e. stopping without
+    // returning. If all strands of a AsyncFrame yield, that call never
+    // returns at all.
+    //
+    // Since strands can invoke asynchronous functions independently, the
+    // asynchronous function calls do not form a stack and must instead be kept
+    // in a map.
+    asyncs: HashMap<AsyncId, AsyncFrame<V>>,
+
+    // Since the AsyncFrames are unordered, the machine needs to keep track of
+    // which one is currently being executed.
+    current_async: AsyncId,
+
+    // When invoking an asynchronous closure, this closure is not immediately
+    // evaluated, rather the strand of the current closure that does not get
+    // access to the return value continues immediately. Before that, a new
+    // AsyncFrame is allocated for the new call, and the evaluated arguments
+    // are placed in its local storage. Then, the identifier of the newly
+    // created AsyncFrame and the index of the instruction at which execution
+    // of that function should begin are pushed on this stack.
+    //
+    // When an asynchronous function returns, the execution immediately
+    // continues at the place where it was invoked. Whenever an execution
+    // strand of an asynchronous closure yields however, the newest entry on
+    // this stack is popped and the indicated closure resumes execution.
+    pending_stack: [(AsyncId, InstructionIndex)],
+
+    // The event loop manages the parallel execution of built-in asynchronous
+    // functions. Invoking a built-in asynchronous function does not
+    // immediately perform a computation, it merely creates a `Future<V>`, which
+    // is added to the event loop. This by itself does not cause anything to
+    // happen, the loop merely stores a set of such futures. A Future<V> can be
+    // polled by an event loop to eventually compute a `V`.
+    //
+    // When a strand of an asynchronous closure yields, and the pending_stack
+    // is empty, all futures that have been added to the event loop start
+    // executing in parallel. When the first of them has produced a value, the
+    // asynchronous closure that performed the corresponding invocation of the
+    // build-in asynchronous function continues execution. A more detailed
+    // description of the functionality provided by the EventLoop is given
+    // further below.
+    //
+    // If the event loop needs to produce a value but no future has been added
+    // to it, execution of the whole program terminates erroneously.
+    event_loop: EventLoop<V>,
+}
+
+// We now take a closer look at the way the virtual machine stores values.
+
+// A Scope consists of a number of storage locations for values, and an
+// optional reference to a parent scope. Each closure stores the reference of
+// the scope in which it was created, or `None` if it wasn't created at
+// runtime. Whenever a closure is invoked, a new scope for that invocation is
+// created, whose parent scope is the one stored in the invoked closure.
+enum Scope<V> {
+    values: [V],
+    parent: Option<ScopeId>,
+}
+
+// When a synchronous closure is invoked, a new StackFrame is created to hold
+// the data necessary for managing that call. It stores the id of the Scope
+// belonging to that call, and some values that can be accessed from the
+// instructions that define what the closure does. When the call has produced a
+// result, the machine looks up in the StackFrame where to store it, and at
+// which instruction to continue execution.
+struct StackFrame<V> {
+    values: [V],
+    scope: ScopeId,
+    dst: Address,
+    return_instruction: InstructionIndex,
+}
+
+// AsyncFrames work the same, but they additionally store the AsyncId of the
+// invoking asynchronous closure, so that the machine can update the
+// current_async when it returns.
+//
+// The triple of an address to store a return value at, and instruction to
+// continue at and an AsyncId to continue as is called a Continuation.
+struct Continuation {
+    instruction: InstructionIndex,
+    dst: Address,
+    call: AsyncId,
+}
+
+struct AsyncFrame<V> {
+    values: [V],
+    scope: ScopeId,
+    continuation: Continuation,
+}
+
+// The globals, scopes and frames are the only locations at which values can be
+// stored. An Address can refer to these values.
+enum Address {
+    // An index into the sequence of global values.
+    Global(GlobalIndex),
+    // An index into the values stored by the frame of the currently executed
+    // closure (synchronous or asynchronous).
+    Local(LocalIndex),
+    // A lookup this kind of address begins at the scope stars by the frame of
+    // the current closure (synchronous or asynchronous), then traverses to the
+    // parent scope `up` many times, and then indexes into the values of that
+    // scope.
+    Scoped { up: AncestorDistance, index: ScopeIndex },
+}
+
+// The local values that belong to the currently executing closure.
+fn locals<V: Value>(vm: VirtualMachine<V>) -> [V] {
+    // Check whether there is a synchronous closure being executed right now.
+    match vm.stack.last() {
+        // There is.
+        Some(frame) => frame.values,
+        // There isn't, so look up the current asynchronous frame.
+        None => vm.asyncs[vm.current_async].values,
+    }
+}
+
+// The scope that belongs to the currently executing closure.
+fn scope<V: Value>(vm: VirtualMachine<V>) -> Scope<V> -> {
+    // Check whether there is a synchronous closure being executed right now.
+    match vm.stack.last() {
+        // There is.
+        Some(frame) => frame.scope,
+        // There isn't, so look up the current asynchronous frame.
+        None => vm.asyncs[vm.current_async].scope,
+    }
+}
+
+// Load a value from an address.
+fn load<V: Value>(a: Address, vm: VirtualMachine<V>) -> V {
+    match a {
+        Address::Global(i) => vm.globals[i],
+        Address::Local(i) => locals(vm)[i],
+        Address::Scoped { up, index } => load_scoped(scope(vm), up, index),
+    }
+}
+
+// The recursive part of loading a value from a scope.
+fn load_scoped<V: Value>(
+    scope: Scope<V>,
+    up: AncestorDistance,
+    index: ScopeIndex,
+) -> V {
+    if up == 0 {
+        scope.values[index]
+    } else {
+        load_scoped(scope.parent.unwrap(), up - 1, index)
+    }
+}
+```
+
+The documentation is a work in progress, see [here](https://github.com/AljoschaMeyer/guvm-rs/blob/49449dad129199f35f38419fd2829cc38e4997e6/src/lib.rs) for a simple reference implementation.
+
+
+
+
+
+
+
+
+<!--
+
+// Set a local value that belong to the currently executing closure.
+fn set_local<V: Value>(i: LocalIndex, v: V, vm: VirtualMachine<V>) -> VirtualMachine<V> {
+    match vm.stack.last() {
+        Some(frame) => vm_update_stack_last(
+            vm,
+            stack_frame_update_locals(frame, frame.values.update(i, vc)),
+        ),
+        None => {
+            let frame = vm.asyncs[vm.current_async];
+            return vm_update_async(
+                vm,
+                vm.current_async,
+                async_frame_update_locals(frame, frame.values.update(i, vc)),
+            );
+        }
+    }
+}
+
+
+
 
 To define the virtual machine semantics, we need to introduce three different concepts: the set of runtime `Value`s, the `Instruction`s that are executed by the vm, and finally a vm `State`.
 
@@ -439,7 +687,7 @@ A note on determinism: `magically_conjure_previously_unused_ordinal(): Nat` is t
 
 ## (Deterministic) Asynchronous Generic Unityped Virtual Machine
 
-The (deterministic) asynchronous generic unityped virtual machine ((d)aguvm) is an extension of the (d)guvm that introduces asynchronous functions. Asynchronous functions are functions that might need to wait for some time onto some outside condition allows them to resume. Multiple asynchronous functions can execute concurrently so that the waiting happens in parallel.
+The (deterministic) asynchronous generic unityped virtual machine ((d)aguvm) is an extension of the (d)guvm that introduces asynchronous functions. Asynchronous functions are functions that might need to wait for some time until some outside condition allows them to resume. Multiple asynchronous functions can execute concurrently so that the waiting happens in parallel.
 
 At any point, a program can call an asynchronous function with a regular `Call` instruction. This executes the function, idly waiting if necessary, and then resumes the program, storing the computed value at some destination address. For the rest of the program, this is indistinguishable from calling a synchronous function.
 
@@ -569,8 +817,6 @@ enum AsyncCall {
     // where to continue when this call returns
     // `None` indicates to return from the current asynchronous context
     continuation: Option<Continuation>,
-    // all asynchronous calls that originated from this one
-    children: Map<AsyncCallId, ()>,
   },
   BuiltIn(Continuation),
 }
@@ -668,6 +914,11 @@ fn step(s: State) -> Status {
       callee,
       arguments,
     } => {
+      // undefined if executed from within a synchronous function call
+      if cx.stack.count() > 0 {
+        undefined!();
+      }
+
       // resolve the value to call
       let f = load(callee, s);
 
@@ -693,14 +944,8 @@ fn step(s: State) -> Status {
             // a unique identifier for the call
             let call_id = cx.active_calls.fresh_key();
 
-            // add it to the set of child calls of the current call
-            let mut new_cx = cx;
-            let current = cx.active_calls.get(cx.current_call);
-            let mut updated_current = current;
-            updated_current.children = current.children.insert(call_id, ());
-            new_cx.active_calls = cx.active_calls.insert(cx.current_call, updated_current);
-
             // add as an active call
+            let mut new_cx = cx;
             new_cx.active_calls = cx.active_calls.insert(call_id, AsyncCall::BuiltIn(Continuation {
               instruction: continue_at,
               call: cx.current_call,
@@ -762,12 +1007,6 @@ fn step(s: State) -> Status {
                     children: Map::empty(),
                   });
 
-                  // add it to the set of child calls of the current call
-                  let current = cx.active_calls.get(cx.current_call);
-                  let mut updated_current = current;
-                  updated_current.children = current.children.insert(call_id, ());
-                  new_cx.active_calls = cx.active_calls.insert(cx.current_call, updated_current);
-
                   // enqueue the call to be executed later
                   new_cx.pending_queue = cx.pending_queue.push(Continuation {
                     instruction: header,
@@ -791,42 +1030,46 @@ fn step(s: State) -> Status {
     Instruction::Yield => {
       let mut new_cx = cx;
 
-      // check whether any built-in asynchronous functions have produced a
-      // value so far
-      let event_loop = get_event_loop(cx);
-      for built_in_return in event_loop.finished() {
-        match built_in_return {
-          None => return Status::Nope,
-          Some(r) => new_cx.return_queue = new_cx.return_queue.push(r),
-        }
+      // undefined if executed from within a synchronous function call
+      if cx.stack.count() > 0 {
+        undefined!();
       }
 
       // if a previous concurrent call has returned, use its result
       if new_cx.return_queue.count() > 0 {
         let AsyncReturn { value, call: call_id } = new_cx.return_queue.pop_first();
-        let call = new_cx.active_calls.get(call_id);
 
-        // recursively clean up all children of the call that returned
-        // (remove itself and all children from pending_queue and result_queue)
-        new_cx = clean_up_active_call(call_id, cx);
-
-        // advance to next state from which to continue execution
-        match call.continuation {
-          // the return value belongs to a concurrent call
-          Some(Continuation { instruction, call }) => {
-            new_cx.current_call = call;
-            new_s.instruction_counter = instruction;
-          }
-          // the return value belongs to a blocking call
+        match new_cx.active_calls.try_get(call_id) {
+          // this asynchronous function call has already returned previously
           None => {
-            if new_s.async_stack.count() == 0 {
-              // program has terminated
-              return Status::Done(value);
-            } else {
-              // pop the async stack and continue execution
-              new_s.async_stack = new_s.async_stack.pop();
-              new_s = store(value, new_cx.dst, new_s);
-              new_s.instruction_counter = new_cx.return_instruction;
+            new_s.async_stack[new_s.async_stack.count() - 1] = new_cx;
+            // by not changing any state, new_s.instruction_counter still points
+            // to a yield instruction, so execution will continue as if that
+             // result had never existed
+          }
+          Some(call) => {
+            // mark this call as having returned
+            new_cx.active_calls = new_cx.active_calls.remove(call.id)
+            // advance to next state from which to continue execution
+            match call.continuation {
+              // the return value belongs to a concurrent call
+              Some(Continuation { instruction, call }) => {
+                new_cx.current_call = call;
+                new_s.async_stack[new_s.async_stack.count() - 1] = new_cx;
+                new_s.instruction_counter = instruction;
+              }
+              // the return value belongs to a blocking call
+              None => {
+                if new_s.async_stack.count() == 0 {
+                  // program has terminated
+                  return Status::Done(value);
+                } else {
+                  // pop the async stack and continue execution
+                  new_s.async_stack = new_s.async_stack.pop();
+                  new_s = store(value, new_cx.dst, new_s);
+                  new_s.instruction_counter = new_cx.return_instruction;
+                }
+              }
             }
           }
         }
@@ -835,13 +1078,21 @@ fn step(s: State) -> Status {
         if new_cx.pending_queue.count() > 0 {
           let Continuation { instruction, call } = new_cx.pending_queue.pop();
           new_cx.current_call = call;
+          new_s.async_stack[new_s.async_stack.count() - 1] = new_cx;
           new_s.instruction_counter = instruction;
         } else {
-          // nothing pending (and nothing has returned yet either)
-          // check whether there are still built-in functions that might return
+          // nothing pending
+
           let event_loop = get_event_loop(new_cx)
           if event_loop.has_pending_calls() {
-            event_loop.block_until_something_has_finished();
+            // block until a built-in asynchronous call has produced a value
+            match event_loop.block_until_something_finishes() {
+              None => return Status::Nope,
+              Some(r) => new_cx.return_queue = new_cx.return_queue.push(r),
+            }
+
+            new_s.async_stack[new_s.async_stack.count() - 1] = new_cx;
+
             // by not changing any state, new_s.instruction_counter still points
             // to a yield instruction, so execution will continue by using the
             // new result
@@ -862,7 +1113,7 @@ fn step(s: State) -> Status {
 
       // resolve the arguments
       let mut args = [];
-      for (i, argument) in arguments.enumerate() {
+      for argument in arguments {
         args = args.push(load(argument, s));
       }
 
@@ -899,9 +1150,6 @@ fn step(s: State) -> Status {
           if A::arity(a) != args.count() {
             return Status::Nope;
           } else {
-            // retrieve the state corresponding to this built-in function
-            let s = s.built_in_states.get(b);
-
             // delegate to the implementation of the built-in function,
             // blocking until the Future results to a value
             match B::invoke(b, args).block() {
@@ -952,7 +1200,6 @@ fn step(s: State) -> Status {
                     scope,
                     values,
                     continuation: None,
-                    children: Map::empty(),
                   });
 
                   new_s.async_stack = s.async_stack.push(new_cx);
@@ -969,18 +1216,6 @@ fn step(s: State) -> Status {
                   new_s.async_stack.last().stack = cx.stack.push(frame);
                   new_s.instruction_counter = header;
                 }
-
-                let frame = StackFrame {
-                  return_instruction: s.instruction_counter + 1,
-                  dst,
-                  scope,
-                  values,
-                };
-
-                let new_cx = cx;
-                new_cx.stack = cx.stack.push(frame);
-                new_s.async_stack[s.async_stack.count() - 1] = new_cx;
-                new_s.instruction_counter = header;
               }
             }
 
@@ -1098,57 +1333,6 @@ fn step(s: State) -> Status {
   return Status::Continue(new_s);
 }
 
-// recursively clean up all children of the call that returned
-// (remove itself and all children from pending_queue and result_queue)
-fn clean_up_active_call(call_id: AsyncCallId, cx: AsyncContext) -> AsyncContext {
-  let new_cx = cx;
-
-  match cx.active_calls[call_id] {
-    Instruction::BuiltIn(_) => {
-      // cancel the pending call
-      let event_loop = get_event_loop(cx);
-      event_loop.cancel(call_id);
-
-      // the call might have already returned
-      // remove all matching return values from the return queue
-      for (i, r) in new_cx.return_queue.enumerate() {
-        if r.call == call_id {
-          new_cx.return_queue = new_cx.return_queue.remove(i);
-        }
-      }
-
-      return new_cx;
-    }
-    Regular {
-      scope,
-      values,
-      continuation,
-      children,
-    } => {
-      // remove all matching return values from the return queue
-      for (i, r) in new_cx.return_queue.enumerate() {
-        if r.call == call_id {
-          new_cx.return_queue = new_cx.return_queue.remove(i);
-        }
-      }
-
-      // remove all pending calls
-      for (i, p) in new_cx.pending_queue.enumerate() {
-        if p.call == call_id {
-          new_cx.pending_queue = new_cx.pending_queue.remove(i);
-        }
-      }
-
-      // recursively clean up children
-      for child in children.keys() {
-        new_cx = clean_up_active_call(child, new_cx);
-      }
-
-      return new_cx;
-    }
-  }
-}
-
 // unchanged from the guvm
 
 // the semantics of a virtual machine with initial state `c`
@@ -1207,3 +1391,26 @@ enum Status {
   Continue(State),
 }
 ```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Features that did not make it:
+- modules, dynamic linking, dynamic loading, position independent code
+- breakpoints, noop -->
